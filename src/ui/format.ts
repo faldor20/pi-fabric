@@ -51,10 +51,15 @@ export const formatDuration = (milliseconds: number): string => {
 };
 
 export const formatTokens = (tokens: number): string => {
+  if (tokens >= 1_000_000) return `${Math.round(tokens / 100_000) / 10}M`;
   if (tokens < 1_000) return String(Math.max(0, Math.round(tokens)));
   if (tokens < 100_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k`;
   return `${(tokens / 1_000).toFixed(0)}k`;
 };
+
+// Shared in/out/cached rendering for agent runs and session usage.
+export const formatUsageTokens = (input: number, output: number, cached: number): string =>
+  `in ${formatTokens(input)} · out ${formatTokens(output)} · cached ${formatTokens(cached)}`;
 
 export const formatCost = (usd: number): string =>
   usd <= 0 ? "$0" : usd < 0.01 ? `$${usd.toFixed(4)}` : usd < 1 ? `$${usd.toFixed(3)}` : `$${usd.toFixed(2)}`;

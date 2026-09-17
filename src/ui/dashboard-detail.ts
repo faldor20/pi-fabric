@@ -18,7 +18,7 @@ import {
   formatActorDataPreview,
   formatClock,
   formatDuration,
-  formatTokens,
+  formatUsageTokens,
   padToWidth,
   safeText,
   wrapPlainText,
@@ -678,7 +678,7 @@ export class DashboardDetailRenderer {
       field("Transport", agent.transport);
       field("Activity", agent.currentTool);
       field("Elapsed", agent.startedAt ? formatDuration((agent.finishedAt ?? now) - agent.startedAt) : undefined);
-      field("Usage", agent.usage ? `${formatTokens(agent.usage.input + agent.usage.output)} tokens · ${agent.toolCalls ?? 0} tools · ${agent.turns ?? 0} turns · $${agent.usage.cost.toFixed(4)}` : undefined);
+      field("Usage", agent.usage ? `${formatUsageTokens(agent.usage.input, agent.usage.output, agent.usage.cacheRead + agent.usage.cacheWrite)} · ${agent.toolCalls ?? 0} tools · ${agent.turns ?? 0} turns · $${agent.usage.cost.toFixed(4)}` : undefined);
       markdownField("Task", agent.task, "task");
       field("Branch", agent.branch);
       field("Worktree", agent.worktree);
@@ -708,7 +708,7 @@ export class DashboardDetailRenderer {
       field(
         "Usage",
         actor.worker?.usage
-          ? `${formatTokens(actor.worker.usage.input + actor.worker.usage.output)} tokens · ${actor.worker.toolCalls ?? 0} tools`
+          ? `${formatUsageTokens(actor.worker.usage.input, actor.worker.usage.output, actor.worker.usage.cacheRead + actor.worker.usage.cacheWrite)} · ${actor.worker.toolCalls ?? 0} tools`
           : undefined,
       );
       field("Host events", actor.events.join(", "));

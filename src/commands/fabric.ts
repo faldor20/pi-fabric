@@ -10,7 +10,8 @@ import { restoreBorrowedInPlaceMain } from "../prewalk/handoff.js";
 import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";
-import { safeText } from "../ui/format.js";
+import { formatUsageTokens, safeText } from "../ui/format.js";
+import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
 import {
   FABRIC_PEER_AWAIT_SETTLE_EVENT,
   FABRIC_PEER_CARDS_EVENT,
@@ -106,6 +107,120 @@ const summarizeLogLine = (entry: unknown): string => {
     return bits.join(" ");
   }
   return truncateMiddle(JSON.stringify(record), 160);
+};
+
+// Token telemetry for /fabric agents, actors, and status. Run records and Pi
+// session entries already carry per-message usage; this only rolls it up.
+// Cached merges cacheRead + cacheWrite (both are cached input tokens).
+interface FabricTokenTotals {
+  input: number;
+  output: number;
+  cached: number;
+}
+
+const numTokens = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) ? value : 0;
+
+const emptyTokenTotals = (): FabricTokenTotals => ({ input: 0, output: 0, cached: 0 });
+
+const addTokenUsage = (totals: FabricTokenTotals, usage: unknown): void => {
+  if (typeof usage !== "object" || usage === null) return;
+  const record = usage as Record<string, unknown>;
+  totals.input += numTokens(record.input);
+  totals.output += numTokens(record.output);
+  totals.cached += numTokens(record.cacheRead) + numTokens(record.cacheWrite);
+};
+
+const hasTokenUsage = (totals: FabricTokenTotals): boolean =>
+  totals.input !== 0 || totals.output !== 0 || totals.cached !== 0;
+
+const formatTokenTotals = (totals: FabricTokenTotals): string =>
+  formatUsageTokens(totals.input, totals.output, totals.cached);
+
+const agentRunModel = (agent: AgentRunRecord | AgentHandleInfo): string => {
+  if (agent.model) return agent.model;
+  if ("requestedModel" in agent && agent.requestedModel) return agent.requestedModel;
+  return agent.runner;
+};
+
+// Single usage → text renderer for agents/actors rows; empty usage reads as
+// "no tokens yet" so unsettled runs stay honest instead of showing zeros.
+const describeUsage = (usage: unknown): string => {
+  const totals = emptyTokenTotals();
+  addTokenUsage(totals, usage);
+  return describeTotals(totals);
+};
+
+// Renderer for already-folded totals (e.g. per-actor rollups). Folding twice
+// would drop cached tokens, which only exist merged after the first fold.
+const describeTotals = (totals: FabricTokenTotals): string =>
+  hasTokenUsage(totals) ? formatTokenTotals(totals) : "no tokens yet";
+
+// Host (Main) spend comes from the session transcript: assistant messages
+// carry the provider usage the runner reported, so status attributes host
+// tokens per model without a live listener that would drift across reloads.
+const collectHostTokens = (context: ExtensionContext): Map<string, FabricTokenTotals> => {
+  const byModel = new Map<string, FabricTokenTotals>();
+  const fallback = context.model ? `${context.model.provider}/${context.model.id}` : "main";
+  const add = (key: string, usage: unknown): void => {
+    const totals = byModel.get(key) ?? emptyTokenTotals();
+    addTokenUsage(totals, usage);
+    byModel.set(key, totals);
+  };
+  for (const entry of context.sessionManager.getEntries()) {
+    if (entry.type === "message") {
+      if (entry.message.role !== "assistant") continue;
+      const { provider, model } = entry.message;
+      add(provider && model ? `${provider}/${model}` : fallback, entry.message.usage);
+    } else if (entry.type === "compaction" || entry.type === "branch_summary") {
+      // Summarization bills host LLM calls outside any turn.
+      add(fallback, entry.usage);
+    }
+  }
+  for (const [key, totals] of [...byModel]) {
+    if (!hasTokenUsage(totals)) byModel.delete(key);
+  }
+  return byModel;
+};
+
+// Per-model breakdown over local run records plus host Main: which models are
+// in use, how many agents/actors used each, and summed in/out/cached tokens.
+// ponytail: local records only; recursion spend settled in child processes
+// surfaces on their own hosts, not here.
+const buildTokenBreakdown = (state: FabricState, context: ExtensionContext): string[] => {
+  const byModel = new Map<string, { runs: number; main: boolean } & FabricTokenTotals>();
+  for (const run of state.agents.list()) {
+    const key = agentRunModel(run);
+    const bucket = byModel.get(key) ?? { runs: 0, main: false, ...emptyTokenTotals() };
+    bucket.runs += 1;
+    addTokenUsage(bucket, "usage" in run ? run.usage : undefined);
+    byModel.set(key, bucket);
+  }
+  for (const [key, host] of collectHostTokens(context)) {
+    const bucket = byModel.get(key) ?? { runs: 0, main: false, ...emptyTokenTotals() };
+    bucket.main = true;
+    bucket.input += host.input;
+    bucket.output += host.output;
+    bucket.cached += host.cached;
+    byModel.set(key, bucket);
+  }
+  if (byModel.size === 0) return ["tokens: no usage recorded yet"];
+  const lines = ["tokens by model:"];
+  const total = emptyTokenTotals();
+  for (const [key, bucket] of [...byModel].sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    const who =
+      bucket.runs > 0
+        ? `${bucket.runs === 1 ? "1 agent/actor" : `${bucket.runs} agents/actors`}${bucket.main ? " + main" : ""}`
+        : "main";
+    lines.push(`  ${key}: ${who} · ${formatTokenTotals(bucket)}`);
+    total.input += bucket.input;
+    total.output += bucket.output;
+    total.cached += bucket.cached;
+  }
+  lines.push(`tokens total: ${formatTokenTotals(total)}`);
+  return lines;
 };
 
 const resolvePrewalkModel = async (
@@ -610,7 +725,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             ? agents
                 .map(
                   (agent) =>
-                    `${agent.id.slice(0, 8)} ${agent.status} ${agent.runner}/${agent.transport} — ${agent.name}`,
+                    `${agent.id.slice(0, 8)} ${agent.status} ${agent.runner}/${agent.transport} — ${agent.name} · ${describeUsage("usage" in agent ? agent.usage : undefined)}`,
                 )
                 .join("\n")
             : "No Fabric agents",
@@ -620,12 +735,20 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       }
       if (command === "actors") {
         const actors = state.actors.list();
+        // Actor spend lives on its agent runs; group once instead of scanning per actor.
+        const tokensByActor = new Map<string, FabricTokenTotals>();
+        for (const run of state.agents.list()) {
+          if (!run.actorId) continue;
+          const totals = tokensByActor.get(run.actorId) ?? emptyTokenTotals();
+          addTokenUsage(totals, "usage" in run ? run.usage : undefined);
+          tokensByActor.set(run.actorId, totals);
+        }
         context.ui.notify(
           actors.length > 0
             ? actors
                 .map(
                   (actor) =>
-                    `${actor.id.slice(0, 8)} ${actor.status} ${actor.runner} q:${actor.queued} — ${actor.name}`,
+                    `${actor.id.slice(0, 8)} ${actor.status} ${actor.runner} q:${actor.queued} — ${actor.name} · ${describeTotals(tokensByActor.get(actor.id) ?? emptyTokenTotals())}`,
                 )
                 .join("\n")
             : "No Fabric actors",
@@ -1191,6 +1314,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           `actors: ${state.actors.list().length} · mesh: ${config.mesh.enabled ? state.mesh.root : "disabled"}`,
           `MCP: ${config.mcp.enabled ? "enabled" : "disabled"}`,
           `UI: ${config.ui.enabled ? `${config.ui.widget} widget above chat` : "disabled"}`,
+          ...buildTokenBreakdown(state, context),
         ].join("\n"),
         "info",
       );

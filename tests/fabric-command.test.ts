@@ -546,3 +546,138 @@ describe("/fabric command", () => {
   });
 
 });
+
+describe("/fabric token usage", () => {
+  const captureHandler = () => {
+    let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
+    const notify = vi.fn();
+    const pi = {
+      registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
+        handler = definition.handler;
+      }),
+    } as unknown as ExtensionAPI;
+    const context = { ui: { notify } } as unknown as ExtensionContext;
+    const register = (state: unknown) => {
+      registerFabricCommand(pi, {
+        state: state as FabricState,
+        fabricUi: {} as FabricUiController,
+        capturedTools: { size: 0 } as unknown as CapturedToolCatalog,
+        applyFabricMode: vi.fn(),
+        suspendToolCapture: vi.fn(),
+      });
+      if (!handler) throw new Error("handler was not registered");
+      return handler;
+    };
+    return { notify, context, register };
+  };
+
+  it("shows in/out/cached tokens on /fabric agents rows", async () => {
+    const { notify, context, register } = captureHandler();
+    const handler = register({
+      ensure: vi.fn().mockResolvedValue(undefined),
+      agents: {
+        list: () => [
+          {
+            id: "aaaabbbbccccdddd", status: "completed", runner: "pi", transport: "process",
+            name: "scout", model: "anthropic/claude-x",
+            usage: { input: 1500, output: 300, cacheRead: 4500, cacheWrite: 0, cost: 0 },
+          },
+          {
+            id: "eeeeffffgggghhhh", status: "running", runner: "pi", transport: "process",
+            name: "fresh",
+          },
+        ],
+      },
+    });
+    await handler("agents", context);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("scout · in 1.5k · out 300 · cached 4.5k"),
+      "info",
+    );
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("fresh · no tokens yet"), "info");
+  });
+
+  it("rolls actor runs up by actorId on /fabric actors rows", async () => {
+    const { notify, context, register } = captureHandler();
+    const handler = register({
+      ensure: vi.fn().mockResolvedValue(undefined),
+      agents: {
+        list: () => [
+          {
+            id: "run1111111111111", status: "completed", runner: "pi", transport: "process",
+            name: "helper run", model: "openai/gpt-x", actorId: "actor-1",
+            usage: { input: 2000, output: 400, cacheRead: 0, cacheWrite: 800, cost: 0 },
+          },
+        ],
+      },
+      actors: {
+        list: () => [
+          { id: "actor-1", status: "idle", runner: "pi", queued: 0, name: "helper" },
+          { id: "actor-2", status: "idle", runner: "pi", queued: 0, name: "quiet" },
+        ],
+      },
+    });
+    await handler("actors", context);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("helper · in 2.0k · out 400 · cached 800"),
+      "info",
+    );
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("quiet · no tokens yet"), "info");
+  });
+
+  it("breaks /fabric status down by model with participant counts and host main", async () => {
+    const { notify, register } = captureHandler();
+    const handler = register({
+      ensure: vi.fn().mockResolvedValue(undefined),
+      cwd: "/work",
+      config: {
+        fullCodeMode: true,
+        capture: { enabled: false },
+        agents: { runner: "pi", transport: "process", model: "inherit", maxConcurrent: 4, maxPerExecution: 8, maxDepth: 3 },
+        prewalk: { mode: "in-place", alwaysRearm: false },
+        mesh: { enabled: false },
+        mcp: { enabled: false },
+        ui: { enabled: false, widget: "none" },
+      },
+      registry: { providers: () => [] },
+      prewalk: { status: () => ({ state: "idle" }) },
+      actors: { list: () => [] },
+      mesh: { root: "" },
+      agents: {
+        list: () => [
+          {
+            id: "run1111111111111", status: "completed", runner: "pi", transport: "process",
+            name: "scout", model: "anthropic/claude-x",
+            usage: { input: 1500, output: 300, cacheRead: 4500, cacheWrite: 0, cost: 0 },
+          },
+          {
+            id: "run2222222222222", status: "completed", runner: "pi", transport: "process",
+            name: "helper run", model: "anthropic/claude-x", actorId: "actor-1",
+            usage: { input: 500, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0 },
+          },
+        ],
+      },
+    });
+    const context = {
+      ui: { notify },
+      model: { provider: "anthropic", id: "claude-x" },
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", id: "m1", parentId: null, timestamp: "", message: { role: "user", content: "hi" } },
+          {
+            type: "message", id: "m2", parentId: "m1", timestamp: "",
+            message: {
+              role: "assistant", provider: "anthropic", model: "claude-x",
+              usage: { input: 2000, output: 500, cacheRead: 1000, cacheWrite: 0, totalTokens: 3500, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            },
+          },
+        ],
+      },
+    } as unknown as ExtensionContext;
+    await handler("status", context);
+    const text = String(notify.mock.calls[0]?.[0] ?? "");
+    expect(text).toContain("tokens by model:");
+    expect(text).toContain("anthropic/claude-x: 2 agents/actors + main · in 4.0k · out 900 · cached 5.5k");
+    expect(text).toContain("tokens total: in 4.0k · out 900 · cached 5.5k");
+  });
+});
